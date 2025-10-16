@@ -4,159 +4,516 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-// #include <time.h>
 
-#define CELL_SIZE 4
-#define GRID_W 500
-#define GRID_H 500
+#define CELL_SIZE 1
+#define GRID_W 1024
+#define GRID_H 1024
 #define MAX_BEINGS 10000
-#define MAX_BELIEF 500
-#define MAX_ZOMBIE_LIFE 1500
+#define MAX_FROZEN 20
+#define CHUNK_SIZE 16
 
-enum {
-	TYPE_NULL = 0,
-	TYPE_ZOMBIE = 1,
-	TYPE_HUMAN = 2,
-	TYPE_HUMAN_PANIC = 3,
-	TYPE_DEAD = 4,
+enum Being_Type {
+	ZOMBIE = 0,
+	HUMAN = 1,
+	HUMAN_PANIC = 2,
+	DEAD = 3,
+};
+
+enum Direction {
+	N = 0,
+	E = 1,
+	S = 2,
+	W = 3,
+};
+
+enum City_Layout {
+	OPEN_CITY = 0,
+	CLOSED_CITY = 1,
 };
 
 typedef struct {
 	int x, y;
-	int dir;
-	int type;
+	enum Direction dir;
+	enum Being_Type type;
 	int belief;
 	int zombieLife;
 	int id;
 } Being;
 
 typedef struct {
-	Vector2 position;
-	float zoom;
-} Camera2DWorld;
+	Being **beings;
+	int count;
+	int capacity;
+} Chunk;
 
 typedef struct {
-	Being being;
-} GridCell;
-
-typedef struct {
-	GridCell cells[GRID_W][GRID_H];
-	int width, height;
+	Chunk chunks[GRID_W / CHUNK_SIZE][GRID_H / CHUNK_SIZE];
+	int chunksW, chunksH;
+	Being beings[MAX_BEINGS];
+	int beingCount, humanCount, zombieCount, deadCount;
+	enum City_Layout layout;
+	unsigned char *wallMap;
+	int wallW, wallH;
 } Grid;
 
-Grid grid;
-Being beings[MAX_BEINGS];
-int clock = 0;
-Color colorZombie = {0, 255, 0, 255};
-Color colorHuman = {200, 0, 200, 255};
-Color colorHumanPanic = {255, 120, 255, 255};
-Color colorWall = {50, 50, 60, 255};
-Color colorDead = {128, 30, 30, 255};
-Color colorHit = {128, 128, 0, 255};
+static Grid grid;
+static Color colorZombie = {0, 255, 0, 255};
+static Color colorHuman = {200, 0, 200, 255};
+static Color colorHumanPanic = {255, 120, 255, 255};
+static Color colorWall = {50, 50, 60, 255};
+static Color colorDead = {128, 30, 30, 255};
 
-void DrawGameGrid(Grid *g, Camera2DWorld *cam, int cellSize) {
-	int startX = (int)(cam->position.x / cellSize);
-	int startY = (int)(cam->position.y / cellSize);
-	int endX = (int)((cam->position.x + GetScreenWidth() / cam->zoom) / cellSize) + 1;
-	int endY = (int)((cam->position.y + GetScreenHeight() / cam->zoom) / cellSize) + 1;
+static inline void GetChunkIndex(int x, int y, int *cx, int *cy) {
+	*cx = x / CHUNK_SIZE;
+	*cy = y / CHUNK_SIZE;
+}
 
-	if (startX < 0) startX = 0;
-	if (startY < 0) startY = 0;
-	if (endX > g->width) endX = g->width;
-	if (endY > g->height) endY = g->height;
+static void AddBeingToChunk(Grid *g, Being *b) {
+	int cx, cy;
+	GetChunkIndex(b->x, b->y, &cx, &cy);
 
-	for (int y = startY; y < endY; y++) {
-		for (int x = startX; x < endX; x++) {
-			Being *b = &g->cells[y][x].being;
-			if (b->type == TYPE_NULL) continue;
+	if (cx < 0 || cx >= g->chunksW || cy < 0 || cy >= g->chunksH) return;
 
-			Color c = RAYWHITE;
-			switch (b->type) {
-				case TYPE_ZOMBIE:
-					c = colorZombie;
-					break;
-				case TYPE_HUMAN:
-					c = colorHuman;
-					break;
-				case TYPE_HUMAN_PANIC:
-					c = colorHumanPanic;
-					break;
-				case TYPE_DEAD:
-					c = colorDead;
-					break;
-			}
+	Chunk *c = &g->chunks[cx][cy];
+	if (c->count >= c->capacity) {
+		c->capacity = (c->capacity == 0) ? 4 : c->capacity * 2;
+		c->beings = realloc(c->beings, c->capacity * sizeof(Being*));
+	}
+	c->beings[c->count++] = b;
+}
 
-			float screenX = (x * cellSize - cam->position.x) * cam->zoom;
-			float screenY = (y * cellSize - cam->position.y) * cam->zoom;
+static void RemoveBeingFromChunk(Grid *g, Being *b, int oldX, int oldY) {
+	int cx, cy;
+	GetChunkIndex(oldX, oldY, &cx, &cy);
 
-			DrawRectangle(
-				(int)screenX,
-				(int)screenY,
-				(int)(cellSize * cam->zoom),
-				(int)(cellSize * cam->zoom),
-				c
-			);
+	if (cx < 0 || cx >= g->chunksW || cy < 0 || cy >= g->chunksH) return;
+
+	Chunk *c = &g->chunks[cx][cy];
+	for (int i = 0; i < c->count; i++) {
+		if (c->beings[i] == b) {
+			c->beings[i] = c->beings[--c->count];
+			return;
 		}
 	}
 }
 
 void MoveBeing(Grid *g, Being *b, int newX, int newY) {
-	g->cells[b->x][b->y].being.type = TYPE_NULL;
-	g->cells[newX][newY].being = *b;
+	int oldX = b->x, oldY = b->y;
+	int oldCx, oldCy, newCx, newCy;
+	GetChunkIndex(oldX, oldY, &oldCx, &oldCy);
+	GetChunkIndex(newX, newY, &newCx, &newCy);
+
+	if (oldCx != newCx || oldCy != newCy) {
+		RemoveBeingFromChunk(g, b, oldX, oldY);
+	}
+
 	b->x = newX;
 	b->y = newY;
+
+	if (oldCx != newCx || oldCy != newCy) {
+		AddBeingToChunk(g, b);
+	}
 }
 
-void SetBeingDead(Being *b) {
-	b->type = TYPE_DEAD;
+void GetNearbyBeings(Grid *g, int x, int y, int radius, Being **out, int *outCount) {
+	*outCount = 0;
+	int cx, cy;
+	GetChunkIndex(x, y, &cx, &cy);
+
+	for (int dx = -1; dx <= 1; dx++) {
+		for (int dy = -1; dy <= 1; dy++) {
+			int nx = cx + dx;
+			int ny = cy + dy;
+			if (nx >= 0 && nx < g->chunksW && ny >= 0 && ny < g->chunksH) {
+				Chunk *c = &g->chunks[nx][ny];
+				for (int i = 0; i < c->count; i++) {
+					Being *b = c->beings[i];
+					int dx = b->x - x;
+					int dy = b->y - y;
+					if (dx*dx + dy*dy <= radius*radius) {
+						out[(*outCount)++] = b;
+					}
+				}
+			}
+		}
+	}
+}
+
+static inline int IsWall(Grid *g, int x, int y) {
+	if (x < 0 || x >= g->wallW || y < 0 || y >= g->wallH) return 1;
+	int idx = y * g->wallW + x;
+	int byteIndex = idx / 8;
+	int bitIndex = idx % 8;
+	return (g->wallMap[byteIndex] >> bitIndex) & 1;
+}
+
+static inline void SetWall(Grid *g, int x, int y, int val) {
+	if (x < 0 || x >= g->wallW || y < 0 || y >= g->wallH) return;
+	int idx = y * g->wallW + x;
+	int byteIndex = idx / 8;
+	int bitIndex = idx % 8;
+	unsigned char mask = 1U << bitIndex;
+	if (val) {
+		g->wallMap[byteIndex] |= mask;
+	} else {
+		g->wallMap[byteIndex] &= ~mask;
+	}
+}
+
+typedef struct {
+	int x, y, w, h;
+} WallRect;
+
+// Temporary grid to track which cells have been merged
+static unsigned char *mergedMap = NULL;
+static int mergedMapSize = 0;
+
+static inline int IsMergedCell(int x, int y, int gridW) {
+	int idx = y * gridW + x;
+	return (mergedMap[idx / 8] >> (idx % 8)) & 1;
+}
+
+static inline void MarkMergedCell(int x, int y, int gridW) {
+	int idx = y * gridW + x;
+	int byteIdx = idx / 8;
+	int bitIdx = idx % 8;
+	unsigned char mask = 1U << bitIdx;
+	mergedMap[byteIdx] |= mask;
+}
+
+// Greedy rectangle merging: expand each rectangle as wide as possible, then as tall as possible
+static WallRect MergeRectangleAt(Grid *g, int startX, int startY) {
+	WallRect rect = {startX, startY, 0, 0};
+
+	// Expand width
+	int x = startX;
+	while (x < g->wallW && IsWall(g, x, startY) && !IsMergedCell(x, startY, g->wallW)) {
+		x++;
+	}
+	rect.w = x - startX;
+
+	// Expand height (only cells that match the width we just found)
+	int y = startY;
+	while (y < g->wallH) {
+		// Check if entire row is wall and unmerged
+		int canExpand = 1;
+		for (int checkX = startX; checkX < startX + rect.w; checkX++) {
+			if (!IsWall(g, checkX, y) || IsMergedCell(checkX, y, g->wallW)) {
+				canExpand = 0;
+				break;
+			}
+		}
+		if (!canExpand) break;
+		y++;
+	}
+	rect.h = y - startY;
+
+	// Mark all cells in this rectangle as merged
+	for (int mx = rect.x; mx < rect.x + rect.w; mx++) {
+		for (int my = rect.y; my < rect.y + rect.h; my++) {
+			MarkMergedCell(mx, my, g->wallW);
+		}
+	}
+
+	return rect;
+}
+
+// Generate merged rectangles for visible area only
+void GenerateMergedWallRects(Grid *g, int startX, int startY, int endX, int endY, WallRect *rects, int *rectCount, int maxRects) {
+	*rectCount = 0;
+
+	// Allocate merged map if needed
+	int mapSize = (g->wallW * g->wallH + 7) / 8;
+	if (mergedMapSize < mapSize) {
+		mergedMap = realloc(mergedMap, mapSize);
+		mergedMapSize = mapSize;
+	}
+	memset(mergedMap, 0, mapSize);
+
+	// Scan visible area for unmerged walls
+	for (int y = startY; y < endY; y++) {
+		for (int x = startX; x < endX; x++) {
+			if (IsWall(g, x, y) && !IsMergedCell(x, y, g->wallW)) {
+				if (*rectCount < maxRects) {
+					rects[(*rectCount)++] = MergeRectangleAt(g, x, y);
+				}
+			}
+		}
+	}
+}
+
+char * GetLayoutString(Grid *g) {
+	if (g->layout == OPEN_CITY) {
+		return "Open City";
+	}
+	return "Closed City";
+}
+
+void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
+	// Calculate visible bounds in world coordinates
+	float screenWidth = GetScreenWidth() / cam->zoom;
+	float screenHeight = GetScreenHeight() / cam->zoom;
+
+	int startX = (int)(cam->target.x - screenWidth / 2.0f) - 1;
+	int startY = (int)(cam->target.y - screenHeight / 2.0f) - 1;
+	int endX = (int)(cam->target.x + screenWidth / 2.0f) + 2;
+	int endY = (int)(cam->target.y + screenHeight / 2.0f) + 2;
+
+	// Clamp to grid bounds
+	startX = (startX < 0) ? 0 : startX;
+	startY = (startY < 0) ? 0 : startY;
+	endX = (endX > g->wallW) ? g->wallW : endX;
+	endY = (endY > g->wallH) ? g->wallH : endY;
+
+	// Generate merged wall rectangles
+	WallRect wallRects[10000];  // Adjust size as needed
+	int wallRectCount = 0;
+	GenerateMergedWallRects(g, startX, startY, endX, endY, wallRects, &wallRectCount, 10000);
+
+	// Draw merged walls
+	for (int i = 0; i < wallRectCount; i++) {
+		WallRect r = wallRects[i];
+		DrawRectangle(r.x, r.y, r.w * cellSize, r.h * cellSize, colorWall);
+		// DrawRectangleLines(r.x, r.y, r.w * cellSize, r.h * cellSize, DARKGRAY);
+	}
+
+	// Draw beings using chunks
+	int startCx = startX / CHUNK_SIZE;
+	int startCy = startY / CHUNK_SIZE;
+	int endCx = (endX / CHUNK_SIZE) + 1;
+	int endCy = (endY / CHUNK_SIZE) + 1;
+
+	// Clamp chunk indices to valid range
+	startCx = (startCx < 0) ? 0 : startCx;
+	startCy = (startCy < 0) ? 0 : startCy;
+	endCx = (endCx > g->chunksW) ? g->chunksW : endCx;
+	endCy = (endCy > g->chunksH) ? g->chunksH : endCy;
+
+	// Draw beings
+	for (int cx = startCx; cx < endCx; cx++) {
+		for (int cy = startCy; cy < endCy; cy++) {
+			Chunk *c = &g->chunks[cx][cy];
+			for (int i = 0; i < c->count; i++) {
+				Being *b = c->beings[i];
+				Color col = colorZombie;
+				switch (b->type) {
+					case HUMAN: col = colorHuman; break;
+					case HUMAN_PANIC: col = colorHumanPanic; break;
+					case DEAD: col = colorDead; break;
+					case ZOMBIE: col = colorZombie; break;
+				}
+				DrawRectangle(b->x, b->y, cellSize, cellSize, col);
+			}
+		}
+	}
+}
+
+int GetRandomDir() {
+	int dirs[] = {N, E, S, W};
+	return dirs[GetRandomValue(0, 3)];
 }
 
 void SetupSim(Grid *g) {
 	memset(g, 0, sizeof(*g));
+	int r = GetRandomValue(0, 1);
+	g->layout = r;
 
-	g->width = GRID_W;
-	g->height = GRID_H;
+	g->wallW = GRID_W;
+	g->wallH = GRID_H;
+	g->wallMap = calloc((GRID_W * GRID_H + 7) / 8, 1);
 
-	int midX = g->width / 2;
-	int midY = g->height / 2;
+	g->chunksW = GRID_W / CHUNK_SIZE;
+	g->chunksH = GRID_H / CHUNK_SIZE;
 
-	g->cells[midX][midY].being.type = TYPE_ZOMBIE;
+	int midX = GRID_W / 2;
+	int midY = GRID_H / 2;
 
-	for (int i = -2; i <= 2; i++) {
-		for (int j = -2; j <= 2; j++) {
-			if (i == 0 && j == 0) continue;
-			int x = midX + i;
-			int y = midY + j;
-			if (x >= 0 && y >= 0 && x < GRID_W && y < GRID_H) {
-				g->cells[x][y].being.type = TYPE_HUMAN;
+	// Borders
+	if (g->layout == OPEN_CITY) {
+		for (int x = 0; x < GRID_W; x++) {
+			for (int y = 0; y < GRID_H; y++) {
+				if (x == 0 || x == GRID_W - 1 || y == 0 || y == GRID_H - 1) {
+					SetWall(g, x, y, 1);
+				}
 			}
+		}
+
+		// Big Rooms
+		for (int i = 0; i < 50; i++) {
+			int rx = GetRandomValue(1, GRID_W - 1);
+			int ry = GetRandomValue(1, GRID_H - 1);
+			int rw = GetRandomValue(50, 150);
+			int rh = GetRandomValue(50, 150);
+			for (int x = rx; x < rx + rw; x++) {
+				for (int y = ry; y < ry + rh; y++) {
+					if (x < GRID_W - 1 && y < GRID_H - 1) {
+						SetWall(g, x, y, 1);
+					}
+				}
+			}
+		}
+	} else {
+		for (int x = 0; x < GRID_W; x++) {
+			for (int y = 0; y < GRID_H; y++) {
+				SetWall(g, x, y, 1);
+			}
+		}
+
+		// Big Rooms
+		for (int i = 0; i < 20; i++) {
+			int rx = GetRandomValue(1, GRID_W - 1);
+			int ry = GetRandomValue(1, GRID_H - 1);
+			int rw = GetRandomValue(50, 250);
+			int rh = GetRandomValue(50, 250);
+			for (int x = rx; x < rx + rw; x++) {
+				for (int y = ry; y < ry + rh; y++) {
+					if (x < GRID_W - 1 && y < GRID_H - 1) {
+						SetWall(g, x, y, 0);
+					}
+				}
+			}
+		}
+
+		// Halls
+		for (int i = 0; i < 120; i++) {
+			int rx = GetRandomValue(1, GRID_W - 1);
+			int ry = GetRandomValue(1, GRID_H - 1);
+			int rw = GetRandomValue(3, 200);
+			int rh = GetRandomValue(3, 200);
+
+			if (rw > rh) {
+				rh = 3;
+			} else if (rh > rw) {
+				rw = 3;
+			}
+
+			for (int x = rx; x < rx + rw; x++) {
+				for (int y = ry; y < ry + rh; y++) {
+					if (x < GRID_W - 1 && y < GRID_H - 1) {
+						SetWall(g, x, y, 0);
+					}
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < MAX_BEINGS; i++) {
+		for (int ok = 0; ok < 100; ok++) {
+			int x = GetRandomValue(2, GRID_W-2);
+			int y = GetRandomValue(2, GRID_H-2);
+			if (!IsWall(g, x, y)) {
+				g->beings[i].x = x;
+				g->beings[i].y = y;
+				g->beings[i].dir = GetRandomDir();
+				g->beings[i].type = HUMAN;
+				g->beings[i].id = g->beingCount;
+				AddBeingToChunk(g, &g->beings[g->beingCount]);
+				g->beingCount++;
+				g->humanCount++;
+				ok = 100;
+			}
+		}
+	}
+
+	g->beings[0].type = ZOMBIE;
+	g->beings[1].type = ZOMBIE;
+	g->beings[2].type = ZOMBIE;
+	g->beings[3].type = ZOMBIE;
+	g->zombieCount = 4;
+	g->humanCount -= 4;
+}
+
+int LookAhead(Grid *g, Being *b) {
+	int x = b->x;
+	int y = b->y;
+	int dist = (b->type == ZOMBIE) ? 10 : 1;
+	
+	for (int i = 0; i < dist; i++) {
+		if (b->dir == N) y--;
+		if (b->dir == E) x++;
+		if (b->dir == S) y++;
+		if (b->dir == W) x--;
+		if (IsWall(g, x, y)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void StepBeing(Grid *g, Being *b) {
+	if (b->type == DEAD) return;
+
+	int shouldMove = 0;
+	if (b->type == HUMAN) {
+		shouldMove = GetRandomValue(0, 4) == 0;
+	} else {
+		shouldMove = GetRandomValue(0, 1) == 0;
+	}
+
+	if (shouldMove){
+		if (LookAhead(g, b) == 0){
+			int xx = b->x;
+			int yy = b->y;
+			if (b->dir == N) yy--;
+			if (b->dir == E) xx++;
+			if (b->dir == S) yy++;
+			if (b->dir == W) xx--;
+			MoveBeing(g, b, xx, yy);
+		} else {
+			b->dir = GetRandomDir();
+		}
+	} else {
+		int changeDirection = GetRandomValue(0, 4) == 0;
+		if (changeDirection) {
+			b->dir = GetRandomDir();
 		}
 	}
 }
 
 int main(void) {
 	SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-	InitWindow(GetScreenWidth(), GetScreenHeight(), "Zombie3 Raylib Port");
+	InitWindow(GetScreenWidth(), GetScreenHeight(), "Zombie Simulation");
 	SetTargetFPS(60);
 
-	Camera2DWorld camera = { .position = {0, 0}, .zoom = 1.0f };
+	int frozenCountdown = MAX_FROZEN;
 	SetupSim(&grid);
 
+	Camera2D camera = {0};
+	camera.offset = (Vector2){GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f};
+	camera.target = (Vector2){GRID_W / 2.0f, GRID_H / 2.0f};
+	camera.zoom = 1.0f;
+
 	while (!WindowShouldClose()) {
-		camera.zoom += GetMouseWheelMove() * (0.1f * camera.zoom);
-		if (camera.zoom < 0.1f) {
-			camera.zoom = 0.1f;
+		if (frozenCountdown == 0) {
+			if (camera.zoom > 3.0f) camera.zoom = 3.0f;
+			else if (camera.zoom < 0.5f) camera.zoom = 0.5f;
+			camera.zoom = expf(logf(camera.zoom) + ((float)GetMouseWheelMove() * 0.1f));
+
+			if (IsKeyDown(KEY_W)) camera.target.y -= 10;
+			if (IsKeyDown(KEY_S)) camera.target.y += 10;
+			if (IsKeyDown(KEY_A)) camera.target.x -= 10;
+			if (IsKeyDown(KEY_D)) camera.target.x += 10;
+			if (IsKeyDown(KEY_Z)) {
+				frozenCountdown = MAX_FROZEN;
+				SetupSim(&grid);
+			}
+
+			for (int i = 0; i < grid.beingCount; i++) {
+				StepBeing(&grid, &grid.beings[i]);
+			}
+		} else {
+			frozenCountdown--;
 		}
 
-		if (IsKeyDown(KEY_W)) camera.position.y -= 10;
-		if (IsKeyDown(KEY_S)) camera.position.y += 10;
-		if (IsKeyDown(KEY_A)) camera.position.x -= 10;
-		if (IsKeyDown(KEY_D)) camera.position.x += 10;
-
 		BeginDrawing();
-			ClearBackground(GRAY);
-			DrawGameGrid(&grid, &camera, CELL_SIZE);
-			DrawText(TextFormat("Camera zoom: %f", camera.zoom), 10, 10, 10, BLACK);
+			ClearBackground(BLACK);
+			BeginMode2D(camera);
+				DrawGameGrid(&grid, &camera, CELL_SIZE);
+			EndMode2D();
+			DrawText(TextFormat("FPS: %d | Zoom: %f | City Layout: %d (%s)", GetFPS(), camera.zoom, grid.layout, GetLayoutString(&grid)), 10, 10, 20, WHITE);
+			DrawText(TextFormat("Zombies: %d", grid.zombieCount), 10, GetScreenHeight() - 25, 20, colorZombie);
+			DrawText(TextFormat("Humans: %d", grid.humanCount), 10, GetScreenHeight() - 50, 20, colorHuman);
+			DrawText(TextFormat("Dead: %d", grid.deadCount), 10, GetScreenHeight() - 75, 20, colorDead);
 		EndDrawing();
 	}
 

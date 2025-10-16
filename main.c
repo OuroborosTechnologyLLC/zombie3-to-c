@@ -3,20 +3,31 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <limits.h>
+#include <math.h>
+#include <time.h>
 
 #define CELL_SIZE 1
-#define GRID_W 1024
-#define GRID_H 1024
-#define MAX_BEINGS 10000
-#define MAX_FROZEN 20
+// #define GRID_W 1024
+// #define GRID_H 1024
+#define GRID_W 512
+#define GRID_H 512
+#define MAX_ANIMATION 50
+// #define MAX_BEINGS 10000
+#define MAX_BEINGS 5000
+#define MAX_BELIEF 100
+#define MAX_FROZEN 10
+#define MAX_VITALITY 2
+#define MAX_ZOMBIE_LIFE 1000
+// #define MAX_ZOMBIE_LIFE 100
+#define ZOMBIE_LIFE_VARIANCE 2
 #define CHUNK_SIZE 16
 
 enum Being_Type {
-	ZOMBIE = 0,
-	HUMAN = 1,
-	HUMAN_PANIC = 2,
-	DEAD = 3,
+	TYPE_ZOMBIE = 0,
+	TYPE_HUMAN = 1,
+	TYPE_HUMAN_PANIC = 2,
+	TYPE_DEAD = 3,
 };
 
 enum Direction {
@@ -24,6 +35,19 @@ enum Direction {
 	E = 1,
 	S = 2,
 	W = 3,
+};
+
+enum Look_Distance {
+	DIST_ZOMBIE = 20,
+	DIST_HUMAN = 10,
+};
+
+enum Look_Target {
+	LOOK_CLEAR = 0,
+	LOOK_WALL = 1,
+	LOOK_ZOMBIE = 2,
+	LOOK_HUMAN = 3,
+	LOOK_OUT_BOUNDS = 4,
 };
 
 enum City_Layout {
@@ -35,8 +59,8 @@ typedef struct {
 	int x, y;
 	enum Direction dir;
 	enum Being_Type type;
-	int belief;
-	int zombieLife;
+	int belief, vitality, zombieLife;
+	int animationTimer;
 	int id;
 } Being;
 
@@ -139,6 +163,21 @@ void GetNearbyBeings(Grid *g, int x, int y, int radius, Being **out, int *outCou
 	}
 }
 
+Being* GetBeingAt(Grid *g, int x, int y) {
+	int cx, cy;
+	GetChunkIndex(x, y, &cx, &cy);
+
+	if (cx < 0 || cx >= g->chunksW || cy < 0 || cy >= g->chunksH) return NULL;
+
+	Chunk *c = &g->chunks[cx][cy];
+	for (int i = 0; i < c->count; i++) {
+		if (c->beings[i]->x == x && c->beings[i]->y == y) {
+			return c->beings[i];
+		}
+	}
+	return NULL;
+}
+
 static inline int IsWall(Grid *g, int x, int y) {
 	if (x < 0 || x >= g->wallW || y < 0 || y >= g->wallH) return 1;
 	int idx = y * g->wallW + x;
@@ -175,10 +214,10 @@ static inline int IsMergedCell(int x, int y, int gridW) {
 
 static inline void MarkMergedCell(int x, int y, int gridW) {
 	int idx = y * gridW + x;
-	int byteIdx = idx / 8;
-	int bitIdx = idx % 8;
-	unsigned char mask = 1U << bitIdx;
-	mergedMap[byteIdx] |= mask;
+	int byteIndex = idx / 8;
+	int bitIndex = idx % 8;
+	unsigned char mask = 1U << bitIndex;
+	mergedMap[byteIndex] |= mask;
 }
 
 // Greedy rectangle merging: expand each rectangle as wide as possible, then as tall as possible
@@ -249,6 +288,67 @@ char * GetLayoutString(Grid *g) {
 	return "Closed City";
 }
 
+void KillBeing(Grid *g, Being *b) {
+	if (b->type == TYPE_HUMAN_PANIC || b->type == TYPE_HUMAN) {
+		g->humanCount--;
+	} else if (b->type == TYPE_ZOMBIE) {
+		g->zombieCount--;
+	}
+	b->type = TYPE_DEAD;
+	g->deadCount++;
+}
+
+void Blast(Grid *g, Camera2D *cam) {
+	Vector2 screenPos = GetMousePosition();
+	float worldX = (screenPos.x - cam->offset.x) / cam->zoom + cam->target.x;
+	float worldY = (screenPos.y - cam->offset.y) / cam->zoom + cam->target.y;
+	int mx = (int)worldX;
+	int my = (int)worldY;
+	int radius = GetRandomValue(8, 16);
+	Being *nearby[1000];
+	int nearbyCount = 0;
+	GetNearbyBeings(g, mx, my, radius, nearby, &nearbyCount);
+
+	for (int dy = -radius; dy <= radius; dy++){
+		for (int dx = -radius; dx <= radius; dx++){
+			int x = mx + dx;
+			int y = my + dy;
+			int d2 = dx * dx + dy * dy;
+			if (d2 <= radius * radius && (x > 0 && x <= GRID_W && y > 0 && y <= GRID_H)) {
+				SetWall(g, x, y, 0);
+			}
+		}
+	}
+
+	for (int i = 0; i < nearbyCount; i++){
+		int dx = nearby[i]->x - mx;
+		int dy = nearby[i]->y - my;
+		int diff = dx * dx + dy * dy;
+		if (diff <= radius * radius){
+			KillBeing(g, nearby[i]);
+		}
+	}
+}
+
+void ConvertHumanToZombie(Grid *g, Being *b, int instantTurn) {
+	if (!instantTurn && b->vitality > 0) {
+		b->vitality--;
+		b->belief = MAX_BELIEF;
+		b->animationTimer = MAX_ANIMATION;
+		if (b->type == TYPE_HUMAN) {
+			b->type = TYPE_HUMAN_PANIC;
+		}
+	} else {
+		b->type = TYPE_ZOMBIE;
+		float r = (float)rand()/(float)(RAND_MAX/(ZOMBIE_LIFE_VARIANCE * 100));
+		int a = roundf(r);
+		b->zombieLife = MAX_ZOMBIE_LIFE + a;
+		b->animationTimer = MAX_ANIMATION;
+		g->zombieCount++;
+		g->humanCount--;
+	}
+}
+
 void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
 	// Calculate visible bounds in world coordinates
 	float screenWidth = GetScreenWidth() / cam->zoom;
@@ -274,7 +374,7 @@ void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
 	for (int i = 0; i < wallRectCount; i++) {
 		WallRect r = wallRects[i];
 		DrawRectangle(r.x, r.y, r.w * cellSize, r.h * cellSize, colorWall);
-		// DrawRectangleLines(r.x, r.y, r.w * cellSize, r.h * cellSize, DARKGRAY);
+		DrawRectangleLines(r.x, r.y, r.w * cellSize, r.h * cellSize, DARKGRAY);
 	}
 
 	// Draw beings using chunks
@@ -297,12 +397,16 @@ void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
 				Being *b = c->beings[i];
 				Color col = colorZombie;
 				switch (b->type) {
-					case HUMAN: col = colorHuman; break;
-					case HUMAN_PANIC: col = colorHumanPanic; break;
-					case DEAD: col = colorDead; break;
-					case ZOMBIE: col = colorZombie; break;
+					case TYPE_HUMAN: col = colorHuman; break;
+					case TYPE_HUMAN_PANIC: col = colorHumanPanic; break;
+					case TYPE_DEAD: col = colorDead; break;
+					case TYPE_ZOMBIE: col = colorZombie; break;
 				}
 				DrawRectangle(b->x, b->y, cellSize, cellSize, col);
+				if (b->animationTimer > 0) {
+					DrawCircleLines(b->x, b->y, cellSize + 3, col);
+					b->animationTimer--;
+				}
 			}
 		}
 	}
@@ -339,11 +443,11 @@ void SetupSim(Grid *g) {
 		}
 
 		// Big Rooms
-		for (int i = 0; i < 50; i++) {
+		for (int i = 0; i < GRID_W / 20; i++) {
 			int rx = GetRandomValue(1, GRID_W - 1);
 			int ry = GetRandomValue(1, GRID_H - 1);
-			int rw = GetRandomValue(50, 150);
-			int rh = GetRandomValue(50, 150);
+			int rw = GetRandomValue(GRID_W / 50, GRID_W / 10);
+			int rh = GetRandomValue(GRID_H / 50, GRID_H / 10);
 			for (int x = rx; x < rx + rw; x++) {
 				for (int y = ry; y < ry + rh; y++) {
 					if (x < GRID_W - 1 && y < GRID_H - 1) {
@@ -360,11 +464,11 @@ void SetupSim(Grid *g) {
 		}
 
 		// Big Rooms
-		for (int i = 0; i < 20; i++) {
+		for (int i = 0; i < GRID_W / 50; i++) {
 			int rx = GetRandomValue(1, GRID_W - 1);
 			int ry = GetRandomValue(1, GRID_H - 1);
-			int rw = GetRandomValue(50, 250);
-			int rh = GetRandomValue(50, 250);
+			int rw = GetRandomValue(GRID_W / 50, GRID_W / 5);
+			int rh = GetRandomValue(GRID_H / 50, GRID_H / 5);
 			for (int x = rx; x < rx + rw; x++) {
 				for (int y = ry; y < ry + rh; y++) {
 					if (x < GRID_W - 1 && y < GRID_H - 1) {
@@ -375,11 +479,11 @@ void SetupSim(Grid *g) {
 		}
 
 		// Halls
-		for (int i = 0; i < 120; i++) {
+		for (int i = 0; i < GRID_W / 10; i++) {
 			int rx = GetRandomValue(1, GRID_W - 1);
 			int ry = GetRandomValue(1, GRID_H - 1);
-			int rw = GetRandomValue(3, 200);
-			int rh = GetRandomValue(3, 200);
+			int rw = GetRandomValue(3, GRID_W / 5);
+			int rh = GetRandomValue(3, GRID_H / 5);
 
 			if (rw > rh) {
 				rh = 3;
@@ -405,7 +509,8 @@ void SetupSim(Grid *g) {
 				g->beings[i].x = x;
 				g->beings[i].y = y;
 				g->beings[i].dir = GetRandomDir();
-				g->beings[i].type = HUMAN;
+				g->beings[i].type = TYPE_HUMAN;
+				g->beings[i].vitality = MAX_VITALITY;
 				g->beings[i].id = g->beingCount;
 				AddBeingToChunk(g, &g->beings[g->beingCount]);
 				g->beingCount++;
@@ -415,57 +520,186 @@ void SetupSim(Grid *g) {
 		}
 	}
 
-	g->beings[0].type = ZOMBIE;
-	g->beings[1].type = ZOMBIE;
-	g->beings[2].type = ZOMBIE;
-	g->beings[3].type = ZOMBIE;
-	g->zombieCount = 4;
-	g->humanCount -= 4;
+	ConvertHumanToZombie(g, &g->beings[0], 1);
+	ConvertHumanToZombie(g, &g->beings[1], 1);
+	ConvertHumanToZombie(g, &g->beings[2], 1);
+	ConvertHumanToZombie(g, &g->beings[3], 1);
 }
 
-int LookAhead(Grid *g, Being *b) {
+Being* LookAheadForBeing(Grid *g, Being *b, int dist, int *result) {
 	int x = b->x;
 	int y = b->y;
-	int dist = (b->type == ZOMBIE) ? 10 : 1;
-	
+
 	for (int i = 0; i < dist; i++) {
 		if (b->dir == N) y--;
 		if (b->dir == E) x++;
 		if (b->dir == S) y++;
 		if (b->dir == W) x--;
+
+		if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) {
+			*result = LOOK_OUT_BOUNDS;
+			return NULL;
+		}
+
 		if (IsWall(g, x, y)) {
-			return 1;
+			*result = LOOK_WALL;
+			return NULL;
+		}
+
+		Being *target = GetBeingAt(g, x, y);
+		if (target != NULL) {
+			*result = LOOK_CLEAR;
+			return target;  // Found a being
 		}
 	}
-	return 0;
+
+	*result = LOOK_CLEAR;
+	return NULL;  // Nothing found
+}
+
+int FindNearestHuman(Grid *g, Being *zombie, int *bestDir) {
+	Being *nearby[1000];
+	int nearbyCount = 0;
+	GetNearbyBeings(g, zombie->x, zombie->y, DIST_ZOMBIE, nearby, &nearbyCount);
+	int closestDist = INT_MAX;
+	int closestIndex = -1;
+
+	for (int i = 0; i < nearbyCount; i++) {
+		if (nearby[i]->type == TYPE_HUMAN || nearby[i]->type == TYPE_HUMAN_PANIC) {
+			int dx = nearby[i]->x - zombie->x;
+			int dy = nearby[i]->y - zombie->y;
+			int dist = dx*dx + dy*dy;
+
+			if (dist < closestDist) {
+				closestDist = dist;
+				closestIndex = i;
+			}
+		}
+	}
+
+	if (closestIndex == -1) return 0;
+
+	int dx = nearby[closestIndex]->x - zombie->x;
+	int dy = nearby[closestIndex]->y - zombie->y;
+
+	if (abs(dy) > abs(dx)) {
+		*bestDir = (dy < 0) ? N : S;
+	} else {
+		*bestDir = (dx > 0) ? E : W;
+	}
+
+	return 1;
+}
+
+int FindNearestZombie(Grid *g, Being *human, int *bestDir) {
+	Being *nearby[1000];
+	int nearbyCount = 0;
+	GetNearbyBeings(g, human->x, human->y, DIST_HUMAN, nearby, &nearbyCount);
+	int closestDist = INT_MAX;
+	int closestIndex = -1;
+
+	for (int i = 0; i < nearbyCount; i++) {
+		if (nearby[i]->type == TYPE_ZOMBIE) {
+			int dx = nearby[i]->x - human->x;
+			int dy = nearby[i]->y - human->y;
+			int dist = dx*dx + dy*dy;
+
+			if (dist < closestDist) {
+				closestDist = dist;
+				closestIndex = i;
+			}
+		}
+	}
+
+	if (closestIndex == -1) return 0;
+
+	int dx = nearby[closestIndex]->x - human->x;
+	int dy = nearby[closestIndex]->y - human->y;
+
+	if (abs(dy) > abs(dx)) {
+		*bestDir = (dy > 0) ? N : S;
+	} else {
+		*bestDir = (dx < 0) ? E : W;
+	}
+
+	return 1;
 }
 
 void StepBeing(Grid *g, Being *b) {
-	if (b->type == DEAD) return;
+	if (b->type == TYPE_DEAD) return;
 
-	int shouldMove = 0;
-	if (b->type == HUMAN) {
-		shouldMove = GetRandomValue(0, 4) == 0;
-	} else {
-		shouldMove = GetRandomValue(0, 1) == 0;
+	if (b->type == TYPE_ZOMBIE) {
+		b->zombieLife--;
+		if (b->zombieLife <= 0) {
+			KillBeing(g, b);
+			return;
+		}
 	}
 
-	if (shouldMove){
-		if (LookAhead(g, b) == 0){
-			int xx = b->x;
-			int yy = b->y;
-			if (b->dir == N) yy--;
-			if (b->dir == E) xx++;
-			if (b->dir == S) yy++;
-			if (b->dir == W) xx--;
-			MoveBeing(g, b, xx, yy);
+	if (b->type == TYPE_HUMAN_PANIC) {
+		if (b->belief > 0) {
+			b->belief--;
 		} else {
+			b->type = TYPE_HUMAN;
+		}
+	}
+
+	int shouldMove = 0;
+	int shouldTurn = 0;
+
+	if (b->type == TYPE_HUMAN) {
+		shouldMove = GetRandomValue(0, 5) == 0;
+		shouldTurn = GetRandomValue(0, 2) == 0;
+	} else if (b->type == TYPE_HUMAN_PANIC) {
+		shouldMove = GetRandomValue(0, 2) == 0;
+		shouldTurn = GetRandomValue(0, 3) == 0;
+	} else {
+		shouldMove = GetRandomValue(0, 3) == 0;
+		shouldTurn = GetRandomValue(0, 1) == 0;
+	}
+
+	if (b->type == TYPE_ZOMBIE) {
+		int bestDir;
+		if (FindNearestHuman(g, b, &bestDir)) {
+			b->dir = bestDir;
+		} else if (shouldTurn) {
 			b->dir = GetRandomDir();
 		}
-	} else {
-		int changeDirection = GetRandomValue(0, 4) == 0;
-		if (changeDirection) {
-			b->dir = GetRandomDir();
+	} else if (b->type == TYPE_HUMAN_PANIC) {
+		int bestDir;
+		if (FindNearestZombie(g, b, &bestDir)) {
+			b->dir = bestDir;
+		}
+	} else if (shouldTurn) {
+		b->dir = GetRandomDir();
+	}
+
+	if (shouldMove) {
+		int lookResult;
+		Being *targetBeing = LookAheadForBeing(g, b, 1, &lookResult);
+
+		int xx = b->x, yy = b->y;
+		if (b->dir == N) yy--;
+		if (b->dir == E) xx++;
+		if (b->dir == S) yy++;
+		if (b->dir == W) xx--;
+
+		if (b->type == TYPE_HUMAN || b->type == TYPE_HUMAN_PANIC) {
+			if (lookResult == LOOK_CLEAR && targetBeing == NULL) {
+				MoveBeing(g, b, xx, yy);
+			}
+		} else if (b->type == TYPE_ZOMBIE) {
+			if (targetBeing != NULL) {
+				if (targetBeing->type == TYPE_HUMAN || targetBeing->type == TYPE_HUMAN_PANIC) {
+					ConvertHumanToZombie(g, targetBeing, 0);
+				}
+				// MoveBeing(g, b, xx, yy);
+			} else if (lookResult == LOOK_WALL) {
+				SetWall(g, xx, yy, 0);
+				MoveBeing(g, b, xx, yy);
+			} else if (lookResult == LOOK_CLEAR) {
+				MoveBeing(g, b, xx, yy);
+			}
 		}
 	}
 }
@@ -474,6 +708,7 @@ int main(void) {
 	SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
 	InitWindow(GetScreenWidth(), GetScreenHeight(), "Zombie Simulation");
 	SetTargetFPS(60);
+	srand((unsigned int)time(NULL));
 
 	int frozenCountdown = MAX_FROZEN;
 	SetupSim(&grid);
@@ -496,6 +731,10 @@ int main(void) {
 			if (IsKeyDown(KEY_Z)) {
 				frozenCountdown = MAX_FROZEN;
 				SetupSim(&grid);
+			}
+
+			if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+				Blast(&grid, &camera);
 			}
 
 			for (int i = 0; i < grid.beingCount; i++) {

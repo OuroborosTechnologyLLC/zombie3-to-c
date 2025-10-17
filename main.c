@@ -75,6 +75,7 @@ typedef struct {
 	int chunksW, chunksH;
 	Being beings[MAX_BEINGS];
 	int beingCount, humanCount, zombieCount, deadCount;
+	int blastRadius, blastX, blastY, blastAnimationTimer;
 	enum City_Layout layout;
 	unsigned char *wallMap;
 	int wallW, wallH;
@@ -328,6 +329,11 @@ void Blast(Grid *g, Camera2D *cam) {
 			KillBeing(g, nearby[i]);
 		}
 	}
+
+	g->blastRadius = radius;
+	g->blastX = mx;
+	g->blastY = my;
+	g->blastAnimationTimer = MAX_ANIMATION;
 }
 
 void ConvertHumanToZombie(Grid *g, Being *b, int instantTurn) {
@@ -374,7 +380,9 @@ void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
 	for (int i = 0; i < wallRectCount; i++) {
 		WallRect r = wallRects[i];
 		DrawRectangle(r.x, r.y, r.w * cellSize, r.h * cellSize, colorWall);
-		DrawRectangleLines(r.x, r.y, r.w * cellSize, r.h * cellSize, DARKGRAY);
+		// if (debug) {
+		// 	DrawRectangleLines(r.x, r.y, r.w * cellSize, r.h * cellSize, DARKGRAY);
+		// }
 	}
 
 	// Draw beings using chunks
@@ -404,11 +412,16 @@ void DrawGameGrid(Grid *g, Camera2D *cam, int cellSize) {
 				}
 				DrawRectangle(b->x, b->y, cellSize, cellSize, col);
 				if (b->animationTimer > 0) {
-					DrawCircleLines(b->x, b->y, cellSize + 3, col);
+					DrawCircleLines(b->x, b->y, cellSize + roundf(b->animationTimer / 12), col);
 					b->animationTimer--;
 				}
 			}
 		}
+	}
+
+	if (g->blastAnimationTimer > 0) {
+		DrawCircleLines(g->blastX, g->blastY, (g->blastAnimationTimer * g->blastRadius) / MAX_ANIMATION, BLUE);
+		g->blastAnimationTimer--;
 	}
 }
 
